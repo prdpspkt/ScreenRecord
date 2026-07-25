@@ -5,10 +5,11 @@ import android.app.Activity
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.DisplayMetrics
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -29,6 +30,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,19 +42,37 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import bid.prabidhibid.androidscreenrecorder.ui.theme.AndroidScreenRecorderTheme
 
 class MainActivity : ComponentActivity() {
 
+    // Set to true when launched from the Quick Settings tile so recording starts immediately.
+    private val startTrigger = mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        handleIntent(intent)
         setContent {
             AndroidScreenRecorderTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    RecorderScreen(modifier = Modifier.padding(innerPadding))
-                }
+                AppRoot(startTrigger)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_START_RECORDING, false) == true) {
+            startTrigger.value = true
+            // Consume it so a config change / recreate doesn't retrigger recording.
+            intent.removeExtra(EXTRA_START_RECORDING)
         }
     }
 
@@ -69,14 +91,41 @@ class MainActivity : ComponentActivity() {
         // H.264 requires even dimensions.
         return Triple(width and 1.inv(), height and 1.inv(), densityDpi)
     }
+
+    companion object {
+        const val EXTRA_START_RECORDING = "extra_start_recording"
+    }
 }
 
 @Composable
-private fun RecorderScreen(modifier: Modifier = Modifier) {
+private fun AppRoot(startTrigger: MutableState<Boolean>) {
+    var showRecordings by remember { mutableStateOf(false) }
+    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        if (showRecordings) {
+            RecordingsScreen(
+                modifier = Modifier.padding(innerPadding),
+                onBack = { showRecordings = false }
+            )
+        } else {
+            RecorderScreen(
+                modifier = Modifier.padding(innerPadding),
+                startTrigger = startTrigger,
+                onOpenRecordings = { showRecordings = true }
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecorderScreen(
+    modifier: Modifier = Modifier,
+    startTrigger: MutableState<Boolean>,
+    onOpenRecordings: () -> Unit
+) {
     val context = LocalContext.current
     val activity = context as MainActivity
 
-    var isRecording by remember { mutableStateOf(false) }
+    var isRecording by remember { mutableStateOf(ScreenRecordService.isRunning) }
     var isAdminActive by remember {
         mutableStateOf(isDeviceAdminActive(context))
     }
@@ -88,7 +137,21 @@ private fun RecorderScreen(modifier: Modifier = Modifier) {
         context.getSystemService(DevicePolicyManager::class.java)!!
     }
 
-    // Step 3: user granted screen-capture consent -> launch the foreground recording service.
+    // Keep the in-app button in sync with the service after the app is minimized/reopened
+    // (the recording may have been stopped from the floating overlay or notification).
+    DisposableEffect(activity) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isRecording = ScreenRecordService.isRunning
+                isAdminActive = isDeviceAdminActive(context)
+            }
+        }
+        activity.lifecycle.addObserver(observer)
+        onDispose { activity.lifecycle.removeObserver(observer) }
+    }
+
+    // Step 3: user granted screen-capture consent -> launch the foreground recording service,
+    // then minimize the app so the recording captures what's behind it.
     val projectionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -103,6 +166,7 @@ private fun RecorderScreen(modifier: Modifier = Modifier) {
             }
             ContextCompat.startForegroundService(context, serviceIntent)
             isRecording = true
+            activity.moveTaskToBack(true)
         } else {
             Toast.makeText(context, "Screen capture was denied", Toast.LENGTH_SHORT).show()
         }
@@ -124,11 +188,50 @@ private fun RecorderScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    // Returns from the "Display over other apps" settings screen; nothing to do but let the
+    // user tap Start again now that the overlay permission may be granted.
+    val overlayPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {}
+
     // Step 4: user picked an admin component from the system dialog.
     val adminLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
         isAdminActive = isDeviceAdminActive(context)
+    }
+
+    // Shared entry point for the Start button and the Quick Settings tile.
+    val beginStart: () -> Unit = {
+        // Step 0: the floating controls need the "Display over other apps" permission.
+        if (!Settings.canDrawOverlays(context)) {
+            Toast.makeText(
+                context,
+                "Allow \"Display over other apps\", then tap Start again",
+                Toast.LENGTH_LONG
+            ).show()
+            overlayPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:${context.packageName}")
+                )
+            )
+        } else {
+            // Step 1: request microphone (+ notification on Android 13+) permissions.
+            val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                permissions += Manifest.permission.POST_NOTIFICATIONS
+            }
+            permissionLauncher.launch(permissions.toTypedArray())
+        }
+    }
+
+    // Kick off recording automatically when launched from the Quick Settings tile.
+    LaunchedEffect(startTrigger.value) {
+        if (startTrigger.value) {
+            startTrigger.value = false
+            if (!ScreenRecordService.isRunning) beginStart()
+        }
     }
 
     Column(
@@ -146,14 +249,7 @@ private fun RecorderScreen(modifier: Modifier = Modifier) {
 
         if (!isRecording) {
             Button(
-                onClick = {
-                    // Step 1: request microphone (+ notification on Android 13+) permissions.
-                    val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        permissions += Manifest.permission.POST_NOTIFICATIONS
-                    }
-                    permissionLauncher.launch(permissions.toTypedArray())
-                },
+                onClick = beginStart,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Start Recording")
@@ -171,6 +267,14 @@ private fun RecorderScreen(modifier: Modifier = Modifier) {
             ) {
                 Text("Stop Recording")
             }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onOpenRecordings,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("View Recordings")
         }
 
         Spacer(Modifier.height(24.dp))
