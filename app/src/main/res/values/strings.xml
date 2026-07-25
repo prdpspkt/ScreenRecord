@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Android Screen Recorder</string>
+    <string name="device_admin_label">Screen Recorder Admin</string>
+    <string name="device_admin_description">Allows Screen Recorder to lock the screen. You can revoke this at any time in Settings.</string>
+</resources>
